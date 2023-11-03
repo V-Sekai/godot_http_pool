@@ -31,16 +31,17 @@
 #include "register_types.h"
 
 #include "core/object/class_db.h"
-#include "summator.h"
+#include "http_pool.h"
 
-void initialize_summator_module(ModuleInitializationLevel p_level) {
+void initialize_http_pool_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
 		return;
 	}
-	ClassDB::register_class<Summator>();
+	ClassDB::register_class<HTTPPool>();
+	ClassDB::register_class<HTTPState>();
 }
 
-void uninitialize_summator_module(ModuleInitializationLevel p_level) {
+void uninitialize_http_pool_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
 		return;
 	}
