@@ -31,16 +31,22 @@
 #ifndef HTTP_POOL_H
 #define HTTP_POOL_H
 
+#include "core/error/error_macros.h"
 #include "core/io/file_access.h"
 #include "core/io/http_client.h"
+#include "core/io/http_client_tcp.h"
 #include "core/io/stream_peer_tcp.h"
 #include "core/io/stream_peer_tls.h"
+#include "core/object/object.h"
 #include "core/object/ref_counted.h"
 #include "core/os/os.h"
+#include "core/variant/callable.h"
+#include "core/variant/typed_array.h"
+#include "scene/main/http_request.h"
 #include "scene/main/node.h"
 
-class Future : public Object {
-	GDCLASS(Future, Object);
+class HTTPPoolFuture : public RefCounted {
+	GDCLASS(HTTPPoolFuture, RefCounted);
 
 protected:
 	static void _bind_methods() {
@@ -48,15 +54,19 @@ protected:
 	}
 };
 
+class HTTPPool;
 class HTTPState : public RefCounted {
 	GDCLASS(HTTPState, RefCounted);
+
+	HTTPPool *http_pool = nullptr;
+	Ref<HTTPClientTCP> http_client;
 
 public:
 	static const int YIELD_PERIOD_MS = 50;
 
 	String out_path;
 
-	Ref<HTTPClient> http;
+	Ref<HTTPClientTCP> http;
 	bool busy = false;
 	bool cancelled = false;
 	bool terminated = false;
@@ -76,14 +86,16 @@ protected:
 	static void _bind_methods();
 
 public:
-	void _init();
 	void set_output_path(String p_out_path);
 	void cancel();
-	void term();
+	void terminate();
 	void http_tick();
-	Ref<HTTPClient> connect_http(String p_hostname, int p_port, bool p_use_ssl);
+	Ref<HTTPClientTCP> connect_http(String p_hostname, int p_port, bool p_use_ssl);
 	Variant wait_for_request();
 	void release();
+	void initialize(Ref<HTTPPool> pool, Ref<HTTPClientTCP> client) {
+		this->http = client;
+	}
 };
 
 class HTTPPool : public Node {
@@ -91,9 +103,9 @@ class HTTPPool : public Node {
 
 private:
 	int next_request = 0;
-	Dictionary pending_requests; // int -> Future
+	HashMap<int, Ref<HTTPPoolFuture>> pending_requests;
 
-	Array http_client_pool;
+	TypedArray<HTTPClientTCP> http_client_pool;
 	int total_http_clients = 5;
 
 protected:
@@ -101,6 +113,13 @@ protected:
 	void _notification(int p_what);
 
 public:
+	HTTPPool() {
+		for (int client_i = 0; client_i < total_http_clients; client_i++) {
+			Ref<HTTPClientTCP> client;
+			client.instantiate();
+			http_client_pool.push_back(client);
+		}
+	}
 	void set_total_clients(int p_total) {
 		total_http_clients = p_total;
 	}
@@ -108,15 +127,19 @@ public:
 	int get_total_clients() const {
 		return total_http_clients;
 	}
-	Ref<HTTPClient> _acquire_client();
-	void _release_client(Ref<HTTPClient> p_http);
+	Ref<HTTPClientTCP> _acquire_client();
+	void _release_client(Ref<HTTPClientTCP> p_http);
 	Ref<HTTPState> new_http_state();
 };
 
 void HTTPState::_bind_methods() {
+	ADD_SIGNAL(MethodInfo("_connection_finished", PropertyInfo(Variant::OBJECT, "http_client", PROPERTY_HINT_RESOURCE_TYPE, "HTTPClient")));
+	ADD_SIGNAL(MethodInfo("_request_finished", PropertyInfo(Variant::BOOL, "success")));
+	ADD_SIGNAL(MethodInfo("download_progressed", PropertyInfo(Variant::INT, "bytes"), PropertyInfo(Variant::INT, "total_bytes")));
+
 	ClassDB::bind_method(D_METHOD("set_output_path", "out_path"), &HTTPState::set_output_path);
 	ClassDB::bind_method(D_METHOD("cancel"), &HTTPState::cancel);
-	ClassDB::bind_method(D_METHOD("term"), &HTTPState::term);
+	ClassDB::bind_method(D_METHOD("term"), &HTTPState::terminate);
 	ClassDB::bind_method(D_METHOD("http_tick"), &HTTPState::http_tick);
 	ClassDB::bind_method(D_METHOD("connect_http", "hostname", "port", "use_ssl"), &HTTPState::connect_http);
 	ClassDB::bind_method(D_METHOD("wait_for_request"), &HTTPState::wait_for_request);
@@ -131,26 +154,29 @@ void HTTPState::cancel() {
 	// Cancel code here.
 }
 
-void HTTPState::term() {
-	// Terminate code here.
+void HTTPState::terminate() {
+	terminated = true;
+	if (http.is_valid()) {
+		http->close();
+	}
+	http.instantiate();
 }
 
 void HTTPState::http_tick() {
-	// HTTP tick code here.
 }
 
-Ref<HTTPClient> HTTPState::connect_http(String p_hostname, int p_port, bool p_use_ssl) {
+Ref<HTTPClientTCP> HTTPState::connect_http(String p_hostname, int p_port, bool p_use_ssl) {
 	// Connect to HTTP code here.
-	return Ref<HTTPClient>();
+	return Ref<HTTPClientTCP>();
 }
 
 Variant HTTPState::wait_for_request() {
-	// Wait for request code here.
-	return Variant();
-}
-
-void HTTPState::release() {
-	// Release code here.
+	sent_request = true;
+	http_pool->connect("http_tick", Callable(this, "http_tick"));
+	Variant ret;
+	// ret = _request_finished.wait(); // Assuming _request_finished is a Thread or similar
+	call_deferred("release");
+	return ret;
 }
 
 void HTTPPool::_bind_methods() {
@@ -163,27 +189,61 @@ void HTTPPool::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("new_http_state"), &HTTPPool::new_http_state);
 }
 
-Ref<HTTPClient> HTTPPool::_acquire_client() {
-	// Acquire client code here.
-	return Ref<HTTPClient>();
+Ref<HTTPClientTCP> HTTPPool::_acquire_client() {
+	if (!http_client_pool.is_empty()) {
+		Ref<HTTPClientTCP> client = http_client_pool.back();
+		http_client_pool.pop_back();
+		return client;
+	}
+
+	// If no available client, create a new one.
+	Ref<HTTPClientTCP> client;
+	client.instantiate();
+	return client;
 }
 
-void HTTPPool::_release_client(Ref<HTTPClient> http) {
-	// Release client code here.
+void HTTPPool::_release_client(Ref<HTTPClientTCP> http) {
+	// Check if there are any pending requests.
+	HashMap<int, Ref<HTTPPoolFuture>>::Iterator E = pending_requests.begin();
+
+	if (E) {
+		Ref<HTTPPoolFuture> f = E->value;
+		pending_requests.erase(E->key);
+		f->emit_signal("completed", http);
+	} else {
+		// If no pending requests, add the client back to the pool.
+		http_client_pool.push_back(http);
+	}
 }
 
 Ref<HTTPState> HTTPPool::new_http_state() {
-	// New HTTP state code here.
-	return Ref<HTTPState>();
+	Ref<HTTPClientTCP> http_client = _acquire_client();
+	Ref<HTTPState> state;
+	state.instantiate();
+	// state->initialize(this, http_client);
+	return state;
 }
 
 void HTTPPool::_notification(int p_what) {
 	switch (p_what) {
 		case Node::NOTIFICATION_INTERNAL_PROCESS: {
+			emit_signal("http_tick");
 		} break;
 		case Node::NOTIFICATION_POSTINITIALIZE: {
 		} break;
 	}
 }
-
+void HTTPState::release() {
+	if (!http_pool) {
+		return;
+	}
+	// if (http_pool->is_connected("http_tick", callable_mp("http_tick", &HTTPState::http_tick()))) {
+	// 	http_pool->disconnect("http_tick", callable_mp("http_tick", &HTTPState::http_tick()));
+	// }
+	if (this->http_pool != nullptr && this->http != nullptr) {
+		this->http_pool->_release_client(this->http);
+		memdelete(http_pool);
+		this->http->unreference();
+	}
+}
 #endif // HTTP_POOL_H
